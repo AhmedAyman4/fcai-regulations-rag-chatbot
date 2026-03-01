@@ -2,26 +2,32 @@ import os
 import time
 import warnings
 import re  # Added for language detection
-from flask import Flask, request, jsonify
+import uvicorn
+from fastapi import FastAPI, Body
+from fastapi.responses import JSONResponse
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import Chroma
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains import RetrievalQA
+# from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+# from langchain.chains import RetrievalQA
+from langchain_classic.chains import RetrievalQA
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_groq import ChatGroq
 # Removed arabic_reshaper and bidi imports as they corrupt text for LLMs
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
 
-# --- Flask App Initialization ---
-app = Flask(__name__)
+# --- FastAPI App Initialization ---
+app = FastAPI()
 
 # --- Configuration ---
-pdf_path = "./USC Faculty of Computer and Artificial Intelligence Internal Regulations (October 2019).pdf"
+pdf_path = "./data//USC Faculty of Computer and Artificial Intelligence Internal Regulations (October 2019).pdf"
 persist_directory = "./chroma_fcai_regulations_db"
 google_api_key = os.environ.get("GOOGLE_API_KEY")
+groq_api_key = os.environ.get("GROQ_API_KEY")
 qa_chain = None
 
 # --- Helper Functions ---
@@ -91,24 +97,40 @@ def initialize_rag_chain():
         vectorstore.persist()
         print("Chroma vector store created and saved successfully!")
 
-    # 5. Initialize Google Generative AI (Gemini)
-    if not google_api_key:
-        print("Error: GOOGLE_API_KEY environment variable not set.")
+    # 5. Initialize Gorq LLM free api
+    if not groq_api_key:
+        print("Error: GROQ_API_KEY environment variable not set.")
+        return None
+    
+    try:
+        groq_llm = ChatGroq(model="llama-3.1-8b-instant",
+                            temperature=0.0,
+                            max_tokens=None,
+                            timeout=None,
+                            max_retries=2,
+                            api_key=groq_api_key)
+    except Exception as e:
+        print(f"Error initializing Groq LLM: {e}")
         return None
 
-    try:
-        google_llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash",
-            temperature=0.0,
-            max_tokens=None,
-            timeout=None,
-            max_retries=2,
-            convert_system_message_to_human=True,
-            google_api_key=google_api_key
-        )
-    except Exception as e:
-        print(f"Error initializing Google LLM: {e}")
-        return None
+    
+    # if not google_api_key:
+    #     print("Error: GOOGLE_API_KEY environment variable not set.")
+    #     return None
+
+    # try:
+    #     google_llm = ChatGoogleGenerativeAI(
+    #         model="gemini-2.5-flash",
+    #         temperature=0.0,
+    #         max_tokens=None,
+    #         timeout=None,
+    #         max_retries=2,
+    #         convert_system_message_to_human=True,
+    #         google_api_key=google_api_key
+    #     )
+    # except Exception as e:
+    #     print(f"Error initializing Google LLM: {e}")
+    #     return None
 
     # 6. Define the prompt template
     prompt_template = """
@@ -143,7 +165,7 @@ def initialize_rag_chain():
 
     # 8. Create a RetrievalQA chain
     chain = RetrievalQA.from_chain_type(
-        llm=google_llm,
+        llm=groq_llm, # FIX: Changed from undefined google_llm
         retriever=retriever,
         chain_type_kwargs={"prompt": prompt},
         chain_type="stuff",
@@ -156,13 +178,13 @@ def initialize_rag_chain():
 
 # --- API Endpoints ---
 
-@app.route("/", methods=["GET"])
+@app.get("/")
 def health_check():
     """Health check endpoint to confirm the API is running."""
-    return jsonify({"status": "API is running and healthy"}), 200
+    return JSONResponse(content={"status": "API is running and healthy"}, status_code=200)
 
-@app.route("/api/chat", methods=["POST"])
-def api_chat():
+@app.post("/api/chat")
+def api_chat(data: dict = Body(default={})):
     """
     The main chat endpoint.
     Expects JSON: {"query": "Your question..."}
@@ -171,18 +193,17 @@ def api_chat():
     global qa_chain
     
     # Check if API key is set
-    if not google_api_key:
-        return jsonify({"error": "Google API key is not configured on the server."}), 500
+    if not groq_api_key: # FIX: Changed to groq_api_key to match the active LLM
+        return JSONResponse(content={"error": "Groq API key is not configured on the server."}, status_code=500)
         
     # Check if chain is initialized
     if qa_chain is None:
-        return jsonify({"error": "RAG chain is not initialized. Check server logs."}), 500
+        return JSONResponse(content={"error": "RAG chain is not initialized. Check server logs."}, status_code=500)
 
     # Get query from request
-    data = request.json
     query = data.get("query")
     if not query:
-        return jsonify({"error": "No 'query' provided in the request body."}), 400
+        return JSONResponse(content={"error": "No 'query' provided in the request body."}, status_code=400)
 
     try:
         # Detect language and get specific instruction
@@ -205,11 +226,11 @@ def api_chat():
         # Combine answer and sources
         response_text = answer + sources
         
-        return jsonify({"answer": response_text})
+        return JSONResponse(content={"answer": response_text})
         
     except Exception as e:
         print(f"Error during chain invocation: {e}")
-        return jsonify({"error": f"An error occurred while processing your request: {e}"}), 500
+        return JSONResponse(content={"error": f"An error occurred while processing your request: {e}"}, status_code=500)
 
 # --- Main Application Runner ---
 if __name__ == "__main__":
@@ -220,7 +241,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
     
     # Run the app
-    app.run(host="0.0.0.0", port=port, debug=False)
+    uvicorn.run(app, host="0.0.0.0", port=port)
 else:
-    # This block runs when Gunicorn imports the file
+    # This block runs when uvicorn/gunicorn imports the file
     qa_chain = initialize_rag_chain()
